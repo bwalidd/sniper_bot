@@ -1,43 +1,91 @@
 #!/usr/bin/env python3
 """
 Telegram Channel Monitor Bot
-- Listens to any channel (without being admin) using a user session
-- Sends persistent alerts to you via bot until you acknowledge
-Commands: /start, /stop, /ack, /status
+- Sends an Apple-style ringtone audio + inline ACK button
+- Repeats until you tap the button or send /ack
 """
 
 import asyncio
+import io
 import logging
+import math
 import os
-from telethon import TelegramClient, events
+import struct
+import wave
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── CONFIGURATION (from environment variables or hardcoded fallback) ──────────
-API_ID       = int(os.environ.get("API_ID",       "10355672"))
-API_HASH     =     os.environ.get("API_HASH",     "60c23bf0a07ba95092629d9c03a875bd")
-BOT_TOKEN    =     os.environ.get("BOT_TOKEN",    "8576356344:AAHCjFcXN6ldSCVXYTafh1JjMkEv6rJRkCE")
-CHANNEL      =     os.environ.get("CHANNEL",      "-1002783527346")
-MY_USER_ID   = int(os.environ.get("MY_USER_ID",   "424011232"))
-STRING_SESSION = os.environ.get("STRING_SESSION", "")  # Set this on Railway
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+API_ID         = int(os.environ.get("API_ID",       "10355672"))
+API_HASH       =     os.environ.get("API_HASH",     "60c23bf0a07ba95092629d9c03a875bd")
+BOT_TOKEN      =     os.environ.get("BOT_TOKEN",    "8576356344:AAHCjFcXN6ldSCVXYTafh1JjMkEv6rJRkCE")
+CHANNEL        =     os.environ.get("CHANNEL",      "-1002783527346")
+MY_USER_ID     = int(os.environ.get("MY_USER_ID",   "424011232"))
+STRING_SESSION =     os.environ.get("STRING_SESSION", "")
 
-ALERT_INTERVAL = 30  # seconds between repeated alerts
+ALERT_INTERVAL = 20  # seconds between ringtone repeats
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Convert CHANNEL to int if it's a numeric ID
 try:
     CHANNEL = int(CHANNEL)
 except ValueError:
-    pass  # keep as string username like "@channelname"
+    pass
 
-# State
-is_listening  = False
+# ── RINGTONE GENERATOR (Apple "Opening" melody approximation) ─────────────────
+def make_ringtone() -> bytes:
+    sample_rate = 44100
+
+    def tone(freq: float, dur: float, vol: float = 0.75) -> list[bytes]:
+        n     = int(sample_rate * dur)
+        fade  = int(sample_rate * 0.012)
+        out   = []
+        for i in range(n):
+            t = i / sample_rate
+            v = vol * math.sin(2 * math.pi * freq * t)
+            if i < fade:
+                v *= i / fade
+            elif i > n - fade:
+                v *= (n - i) / fade
+            out.append(struct.pack("<h", int(v * 32767)))
+        return out
+
+    def silence(dur: float) -> list[bytes]:
+        return [struct.pack("<h", 0)] * int(sample_rate * dur)
+
+    # Notes: E5 D5 A4 / E5 D5 G4 / E5 D5 A4 G4 E4
+    E5, D5, A4, G4, E4 = 659.25, 587.33, 440.00, 392.00, 329.63
+    frames: list[bytes] = []
+    for seq in [
+        (E5, 0.13), None, (D5, 0.13), None, (A4, 0.28), None,
+        (E5, 0.13), None, (D5, 0.13), None, (G4, 0.28), None,
+        (E5, 0.13), None, (D5, 0.13), None, (A4, 0.13), None,
+        (G4, 0.13), None, (E4, 0.38),
+    ]:
+        if seq is None:
+            frames += silence(0.04)
+        else:
+            frames += tone(*seq)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "w") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"".join(frames))
+    return buf.getvalue()
+
+RINGTONE_BYTES = make_ringtone()
+log.info("Ringtone generated: %d bytes", len(RINGTONE_BYTES))
+
+# ── STATE ─────────────────────────────────────────────────────────────────────
+is_listening   = False
 pending_alerts: list[dict] = []
 alert_task: asyncio.Task | None = None
 
-# Use StringSession if available (cloud), otherwise file session (local)
+# ── CLIENTS ───────────────────────────────────────────────────────────────────
 if STRING_SESSION:
     user_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 else:
@@ -45,9 +93,7 @@ else:
 
 bot = TelegramClient("bot_session", API_ID, API_HASH)
 
-
-# ── ALERT LOOP ───────────────────────────────────────────────────────────────
-
+# ── ALERT LOOP ────────────────────────────────────────────────────────────────
 async def alert_loop() -> None:
     global pending_alerts
     while True:
@@ -55,18 +101,26 @@ async def alert_loop() -> None:
         if not active:
             pending_alerts.clear()
             break
+
         for alert in active:
             try:
-                await bot.send_message(
+                ring = io.BytesIO(RINGTONE_BYTES)
+                ring.name = "ringtone.wav"
+                await bot.send_file(
                     MY_USER_ID,
-                    f"🔔 **NEW MESSAGE in channel**\n\n"
-                    f"👤 From: {alert['sender']}\n"
-                    f"💬 {alert['text']}\n\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
-                    f"Send /ack to silence · /stop to quit",
+                    ring,
+                    caption=(
+                        f"🔔 **NEW MESSAGE**\n\n"
+                        f"👤 {alert['sender']}\n"
+                        f"💬 {alert['text']}"
+                    ),
+                    buttons=[
+                        [Button.inline("✅  Stop alert", b"ack")],
+                    ],
                 )
             except Exception as e:
-                log.error("Failed to send alert: %s", e)
+                log.error("Failed to send ringtone alert: %s", e)
+
         await asyncio.sleep(ALERT_INTERVAL)
 
 
@@ -77,8 +131,22 @@ async def queue_alert(text: str, sender: str) -> None:
         alert_task = asyncio.create_task(alert_loop())
 
 
-# ── BOT COMMANDS ─────────────────────────────────────────────────────────────
+# ── INLINE BUTTON: tap "Stop alert" on the notification ──────────────────────
+@bot.on(events.CallbackQuery(data=b"ack"))
+async def cb_ack(event):
+    if event.sender_id != MY_USER_ID:
+        await event.answer("Not authorised.")
+        return
+    for a in pending_alerts:
+        a["acked"] = True
+    await event.answer("✅ Alert stopped!")
+    await event.edit(
+        (await event.get_message()).text + "\n\n✅ _Acknowledged_",
+        buttons=None,
+    )
 
+
+# ── BOT COMMANDS ──────────────────────────────────────────────────────────────
 def only_me(event) -> bool:
     return event.sender_id == MY_USER_ID
 
@@ -90,10 +158,10 @@ async def cmd_start(event):
     global is_listening
     is_listening = True
     await event.respond(
-        f"✅ **Monitoring started**\n\n"
-        f"/stop — stop monitoring\n"
-        f"/ack  — silence current alerts\n"
-        f"/status — current state"
+        "✅ **Monitoring started**\n\n"
+        "/stop — stop monitoring\n"
+        "/ack  — silence current alerts\n"
+        "/status — current state"
     )
 
 
@@ -132,17 +200,16 @@ async def cmd_status(event):
     )
 
 
-# ── USER SESSION: watch the channel ─────────────────────────────────────────
-
+# ── CHANNEL WATCHER ───────────────────────────────────────────────────────────
 @user_client.on(events.NewMessage(chats=CHANNEL))
 async def on_channel_message(event):
     if not is_listening:
         return
     try:
-        sender = await event.get_sender()
+        sender      = await event.get_sender()
         sender_name = (
-            getattr(sender, "username", None)
-            or getattr(sender, "title", None)
+            getattr(sender, "username",   None)
+            or getattr(sender, "title",   None)
             or getattr(sender, "first_name", None)
             or "Unknown"
         )
@@ -150,19 +217,18 @@ async def on_channel_message(event):
         sender_name = "Unknown"
 
     text = event.text or "[media / non-text message]"
-    log.info("New message from %s: %s", sender_name, text[:80])
+    log.info("Channel message from %s: %s", sender_name, text[:80])
     await queue_alert(text, sender_name)
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
-
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main() -> None:
     await user_client.start()
     me = await user_client.get_me()
-    log.info("User session: logged in as %s (@%s)", me.first_name, me.username)
+    log.info("User session: %s (@%s)", me.first_name, me.username)
 
     await bot.start(bot_token=BOT_TOKEN)
-    log.info("Bot started. Send /start to begin monitoring.")
+    log.info("Bot ready. Send /start to begin monitoring.")
 
     try:
         await bot.send_message(MY_USER_ID, "🤖 Bot is online. Send /start to begin.")
