@@ -19,11 +19,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-API_ID         = int(os.environ.get("API_ID",       "10355672"))
-API_HASH       =     os.environ.get("API_HASH",     "60c23bf0a07ba95092629d9c03a875bd")
-BOT_TOKEN      =     os.environ.get("BOT_TOKEN",    "8576356344:AAHCjFcXN6ldSCVXYTafh1JjMkEv6rJRkCE")
-CHANNEL        =     os.environ.get("CHANNEL",      "-1002783527346")
-MY_USER_ID     = int(os.environ.get("MY_USER_ID",   "424011232"))
+API_ID         = int(os.environ["API_ID"])
+API_HASH       =     os.environ["API_HASH"]
+BOT_TOKEN      =     os.environ["BOT_TOKEN"]
+CHANNEL        =     os.environ.get("CHANNEL", "")
+MY_USER_ID     = int(os.environ["MY_USER_ID"])
 STRING_SESSION =     os.environ.get("STRING_SESSION", "")
 
 ALERT_INTERVAL = 20  # seconds between ringtone repeats
